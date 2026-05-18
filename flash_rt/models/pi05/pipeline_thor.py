@@ -62,6 +62,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
     layers = dims['layers']
     enc_seq = dims['enc_seq']
     total_keys = dims['total_keys']
+    action_dim = int(dims.get('action_dim', 32))
     D3 = 3 * D
     Q_dim = NH * HD
     K_dim = HD
@@ -101,7 +102,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
 
     for s in range(steps):
         # ── Action input: noise → x ──
-        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, action_dim, 0.0, stream)
         fvk.add_bias_fp16(x, ain_b, S, D, stream)
 
         for l in range(layers):
@@ -179,8 +180,8 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
 
-        fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-        fvk.add_bias_fp16(noise, aob, S, 32, stream)
+        fvk.gmm_fp16(ctx, xn, aow, noise, S, action_dim, D, 1.0, stream)
+        fvk.add_bias_fp16(noise, aob, S, action_dim, stream)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -199,6 +200,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     NH = dims['NH']; HD = dims['HD']
     steps = dims['steps']; layers = dims['layers']
     enc_seq = dims['enc_seq']; total_keys = dims['total_keys']
+    action_dim = int(dims.get('action_dim', 32))
     Q_dim = NH * HD
     attn_scale = 1.0 / math.sqrt(float(HD))
     D3 = 3 * D
@@ -225,7 +227,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     _gpu_zero(calib_buf, layers * 4 * 4, stream)
 
     for s in range(steps):
-        fvk_mod.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk_mod.gmm_fp16(ctx, noise, ain_w, x, S, D, action_dim, 0.0, stream)
         fvk_mod.add_bias_fp16(x, ain_b, S, D, stream)
 
         for l in range(layers):
@@ -318,8 +320,8 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
         fi = s * S * D3
         fs_ptr = fs + fi * 2
         fvk_mod.adarms_fp16(x, fs_ptr, xn, gate_buf, S, D, stream)
-        fvk_mod.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-        fvk_mod.add_bias_fp16(noise, aob, S, 32, stream)
+        fvk_mod.gmm_fp16(ctx, xn, aow, noise, S, action_dim, D, 1.0, stream)
+        fvk_mod.add_bias_fp16(noise, aob, S, action_dim, stream)
 
     _gpu_copy(calib_scales_ptr, calib_buf, layers * 4 * 4, stream)
     _gpu_sync(stream)

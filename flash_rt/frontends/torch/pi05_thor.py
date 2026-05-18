@@ -71,12 +71,17 @@ class Pi05TorchFrontendThor:
         set_prompt(prompt_text)
         infer(observation) -> {"actions": np.ndarray}
     """
+    DEFAULT_NUM_VIEWS = 2
+    CHUNK_SIZE = 10
+    ACTION_DIM = 32
+    DIFFUSION_STEPS = 10
+    OUTPUT_ACTION_DIM = LIBERO_ACTION_DIM
 
     # -----------------------------------------------------------------------
     # Construction
     # -----------------------------------------------------------------------
 
-    def __init__(self, checkpoint_dir: str, num_views: int = 2,
+    def __init__(self, checkpoint_dir: str, num_views: int = None,
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True):
         """
@@ -86,7 +91,14 @@ class Pi05TorchFrontendThor:
                 Torch usually finds fast graph on trial 0-1.
         """
         checkpoint_dir = pathlib.Path(checkpoint_dir)
-        self.num_views = num_views
+        if num_views is None:
+            num_views = self.DEFAULT_NUM_VIEWS
+        self.num_views = int(num_views)
+        self.action_dim = int(self.ACTION_DIM)
+        self.output_action_dim = (
+            None if self.OUTPUT_ACTION_DIM is None else int(self.OUTPUT_ACTION_DIM)
+        )
+        self.diffusion_steps = int(self.DIFFUSION_STEPS)
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
         self.autotune = int(autotune) if autotune is not True else 3
@@ -152,7 +164,9 @@ class Pi05TorchFrontendThor:
                 "For Orbax/JAX checkpoints, use ThorPipelineJax.")
         self._checkpoint_path = str(safetensors_path)
         self._load_weights(safetensors_path)
-        logger.info("Pi05TorchFrontendThor initialised (num_views=%d)", num_views)
+        logger.info(
+            "Pi05TorchFrontendThor initialised (num_views=%d, chunk=%d, action_dim=%d)",
+            self.num_views, self.CHUNK_SIZE, self.action_dim)
 
     # -----------------------------------------------------------------------
     # norm_stats
@@ -309,13 +323,14 @@ class Pi05TorchFrontendThor:
 
         # RoPE table
         inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device='cuda') / 256))
-        kp = inv_freq[None, :] * torch.arange(1200, device='cuda')[:, None].float()
+        rope_len = max(1200, Se_max + self.CHUNK_SIZE)
+        kp = inv_freq[None, :] * torch.arange(rope_len, device='cuda')[:, None].float()
         self._kc_t = torch.cos(kp).to(fp16)
         self._ks_t = torch.sin(kp).to(fp16)
         self._enc_rope = torch.empty(Se_max, 256, dtype=fp16, device='cuda')
 
         # KV cache
-        Sa, Da, Ha, La = 10, 1024, 4096, 18
+        Sa, Da, Ha, La = self.CHUNK_SIZE, 1024, 4096, 18
         self.Sa = Sa; self.Da = Da; self.Ha = Ha; self.La = La
         total_keys_max = Se_max + Sa
         self._Kc = torch.zeros(Le, total_keys_max, HDe, dtype=fp16, device='cuda')
@@ -334,10 +349,10 @@ class Pi05TorchFrontendThor:
         self._enc_fg     = torch.empty(Se_max, De, dtype=fp16, device='cuda')
 
         # ===============================================================
-        # Decoder / AE  (18 layers, 10 steps)
+        # Decoder / AE
         # ===============================================================
         dp = 'paligemma_with_expert.gemma_expert'
-        steps = 10
+        steps = self.diffusion_steps
         D3a = 3 * Da
 
         # Decoder/AE per-layer weights loaded declaratively above as flat cats:
@@ -353,6 +368,21 @@ class Pi05TorchFrontendThor:
         # Note: action_out_proj has -1/steps scaling baked in
         self._aow = g('action_out_proj.weight').t().contiguous() * (-1.0 / steps)
         self._aob = g('action_out_proj.bias') * (-1.0 / steps)
+        if self._ain_w.shape != (self.action_dim, Da):
+            raise ValueError(
+                "action_in_proj.weight shape does not match this frontend: "
+                f"expected transposed shape {(self.action_dim, Da)}, "
+                f"got {tuple(self._ain_w.shape)}. Check ACTION_DIM and checkpoint.")
+        if self._aow.shape != (Da, self.action_dim):
+            raise ValueError(
+                "action_out_proj.weight shape does not match this frontend: "
+                f"expected transposed shape {(Da, self.action_dim)}, "
+                f"got {tuple(self._aow.shape)}. Check ACTION_DIM and checkpoint.")
+        if self._ain_b.numel() != Da or self._aob.numel() != self.action_dim:
+            raise ValueError(
+                "action projection bias shape does not match this frontend: "
+                f"ain_b={tuple(self._ain_b.shape)}, aob={tuple(self._aob.shape)}, "
+                f"expected ain_b=({Da},), aob=({self.action_dim},).")
 
         self._ae_w_dev = torch.tensor(self._ae_w_scales, dtype=torch.float32, device='cuda')
 
@@ -380,7 +410,7 @@ class Pi05TorchFrontendThor:
         self._ae_xn_fp8  = torch.zeros(Sa * Da, dtype=torch.uint8, device='cuda')
         self._ae_hid_fp8 = torch.zeros(Sa * Ha, dtype=torch.uint8, device='cuda')
         self._ae_ctx_fp8 = torch.zeros(Sa * 8 * 256, dtype=torch.uint8, device='cuda')
-        self._g_noise = torch.zeros(Sa, 32, dtype=fp16, device='cuda')
+        self._g_noise = torch.zeros(Sa, self.action_dim, dtype=fp16, device='cuda')
 
         # Calibration scale buffers
         self._enc_calib_scales = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
@@ -492,12 +522,12 @@ class Pi05TorchFrontendThor:
         self._ae_xn_fp8_b2  = torch.zeros(B * Sa * Da, dtype=torch.uint8, device='cuda')
         self._ae_hid_fp8_b2 = torch.zeros(B * Sa * Ha, dtype=torch.uint8, device='cuda')
         self._ae_ctx_fp8_b2 = torch.zeros(B * Sa * 8 * 256, dtype=torch.uint8, device='cuda')
-        self._g_noise_b2 = torch.zeros(B * Sa, 32, dtype=fp16, device='cuda')
+        self._g_noise_b2 = torch.zeros(B * Sa, self.action_dim, dtype=fp16, device='cuda')
         # Per-step velocity scratch for the CFG-batched graph: each step
         # writes (v_cond, v_uncond) here before the in-graph cfg_combine
         # mixes them into ``_g_noise_b2`` slot 0. Always allocated; the
         # non-CFG b2 path simply doesn't reference it.
-        self._v_b2 = torch.zeros(B * Sa, 32, dtype=fp16, device='cuda')
+        self._v_b2 = torch.zeros(B * Sa, self.action_dim, dtype=fp16, device='cuda')
 
         self.B = int(B)
         logger.info(
@@ -573,7 +603,7 @@ class Pi05TorchFrontendThor:
 
     def _ensure_cfg_buffers(self):
         """Lazy-allocate the CFG-only intermediate buffers."""
-        n = self.Sa * 32
+        n = self.Sa * self.action_dim
         if self._noise_R_snapshot is None:
             self._noise_R_snapshot = torch.empty(
                 n, dtype=fp16, device='cuda')
@@ -738,10 +768,10 @@ class Pi05TorchFrontendThor:
             # matches the JAX frontend's noise draw at the same
             # ``np.random.seed`` — required for cross-backend cos
             # ≥ 0.999 at all β.
-            R_np = np.random.randn(Sa, 32).astype(np.float16)
+            R_np = np.random.randn(Sa, self.action_dim).astype(np.float16)
             R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
-            self._g_noise_b2.view(-1, 32)[0:Sa].copy_(R)
-            self._g_noise_b2.view(-1, 32)[Sa:2 * Sa].copy_(R)
+            self._g_noise_b2.view(-1, self.action_dim)[0:Sa].copy_(R)
+            self._g_noise_b2.view(-1, self.action_dim)[Sa:2 * Sa].copy_(R)
 
         self._cfg_pipeline = Pi05ThorCFGBatchedPipeline(
             fvk,
@@ -840,9 +870,9 @@ class Pi05TorchFrontendThor:
             # numpy CPU RNG so the bit pattern matches the JAX frontend
             # under the same ``np.random.seed`` (cross-backend cos
             # contract — see ``_seed_b2_noise_from_R`` for the rationale).
-            R_np = np.random.randn(self.Sa, 32).astype(np.float16)
+            R_np = np.random.randn(self.Sa, self.action_dim).astype(np.float16)
             R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
-            self._g_noise.view(-1, 32).copy_(R)
+            self._g_noise.view(-1, self.action_dim).copy_(R)
             self._cfg_pipeline.run_pipeline()
             raw_actions = self._g_noise.float().cpu().numpy()
 
@@ -850,7 +880,7 @@ class Pi05TorchFrontendThor:
         self.latency_records.append(latency_ms)
 
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        robot_actions = self._select_output_actions(unnorm)
         if debug:
             logger.info(
                 "CFG raw[0,:5]: %s, latency: %.1f ms (beta=%.2f)",
@@ -957,7 +987,7 @@ class Pi05TorchFrontendThor:
 
         # ---- Time conditioning (precompute per-step AdaRMSNorm styles) ----
         Sa, Da, La = self.Sa, self.Da, self.La
-        steps = 10; D3a = 3 * Da
+        steps = self.diffusion_steps; D3a = 3 * Da
         sa_all = torch.zeros(steps * La * Sa, D3a, dtype=fp16, device='cuda')
         sf_all = torch.zeros(steps * La * Sa, D3a, dtype=fp16, device='cuda')
         fs_all = torch.zeros(steps * Sa, D3a, dtype=fp16, device='cuda')
@@ -1145,7 +1175,8 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': self.La, 'enc_seq': Se,
+            'steps': self.diffusion_steps, 'layers': self.La, 'enc_seq': Se,
+            'action_dim': self.action_dim,
             'total_keys': total_keys,
         }
 
@@ -1328,7 +1359,8 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.diffusion_steps, 'layers': La, 'enc_seq': Se,
+            'action_dim': self.action_dim,
             'total_keys': total_keys,
         }
 
@@ -1457,7 +1489,8 @@ class Pi05TorchFrontendThor:
         }
         ae_dims_b2 = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.diffusion_steps, 'layers': La, 'enc_seq': Se,
+            'action_dim': self.action_dim,
             'total_keys': total_keys,
         }
 
@@ -1602,7 +1635,8 @@ class Pi05TorchFrontendThor:
         }
         ae_dims_b2 = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.diffusion_steps, 'layers': La, 'enc_seq': Se,
+            'action_dim': self.action_dim,
             'total_keys': total_keys,
         }
 
@@ -1852,7 +1886,7 @@ class Pi05TorchFrontendThor:
                                     ].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
             results.append(
-                {"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+                {"actions": self._select_output_actions(unnorm)})
         return results
 
     # -----------------------------------------------------------------------
@@ -1921,6 +1955,17 @@ class Pi05TorchFrontendThor:
     # Inference
     # -----------------------------------------------------------------------
 
+    def _select_output_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Return the externally visible robot action slice.
+
+        Base Pi0.5 keeps the historical LIBERO 7-DOF output. Derived
+        frontends can set ``OUTPUT_ACTION_DIM = None`` to return every
+        model action dimension.
+        """
+        if self.output_action_dim is None:
+            return actions
+        return actions[:, :self.output_action_dim]
+
     def infer(self, observation, debug=False):
         """Run inference: images -> CUDA graph replay -> actions.
 
@@ -1928,7 +1973,7 @@ class Pi05TorchFrontendThor:
             observation: dict with 'image' and 'wrist_image' (or 'images' list).
                          Each image is (224,224,3) uint8 or float16 numpy.
         Returns:
-            {"actions": np.ndarray}  shape (Sa, LIBERO_ACTION_DIM)
+            {"actions": np.ndarray}  shape (Sa, output_action_dim)
         """
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug)
@@ -1971,9 +2016,9 @@ class Pi05TorchFrontendThor:
         # standard infer path (cross-backend determinism + lets the RL
         # CFG path's β=1.0 output collapse cleanly to this cond-only
         # baseline — both use the same numpy seed → same R).
-        R_np = np.random.randn(self.Sa, 32).astype(np.float16)
+        R_np = np.random.randn(self.Sa, self.action_dim).astype(np.float16)
         R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
-        self._g_noise.view(-1, 32).copy_(R)
+        self._g_noise.view(-1, self.action_dim).copy_(R)
         self._enc_ae_graph.replay()
         torch.cuda.synchronize()
 
@@ -1983,7 +2028,7 @@ class Pi05TorchFrontendThor:
         # ---- Post-process ----
         raw_actions = self._g_noise.float().cpu().numpy()
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        robot_actions = self._select_output_actions(unnorm)
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
@@ -2150,7 +2195,8 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': self.La, 'enc_seq': Se,
+            'steps': self.diffusion_steps, 'layers': self.La, 'enc_seq': Se,
+            'action_dim': self.action_dim,
             'total_keys': total_keys,
         }
 
@@ -2263,7 +2309,8 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.diffusion_steps, 'layers': La, 'enc_seq': Se,
+            'action_dim': self.action_dim,
             'total_keys': total_keys,
         }
 

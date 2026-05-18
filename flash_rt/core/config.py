@@ -6,7 +6,7 @@ from typing import Optional
 
 import yaml
 
-CONFIGS_DIR = Path(__file__).parent.parent.parent / "configs"
+CONFIGS_DIR = Path(__file__).parent.parent / "configs"
 
 
 @dataclass

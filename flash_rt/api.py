@@ -198,7 +198,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             and force fresh FP8 quantization + calibration.
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
-        config: model config name: "pi05", "pi0", "groot", "pi0fast"
+        config: model config name: "pi05", "pi05_rby1", "pi0", "groot", "pi0fast"
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -242,9 +242,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
-    if config not in ("pi05", "groot", "pi0", "pi0fast"):
+    if config not in ("pi05", "pi05_rby1", "groot", "pi0", "pi0fast"):
         raise ValueError(
-            f"Unknown config: {config}. Supported: pi05, groot, pi0, pi0fast")
+            f"Unknown config: {config}. Supported: pi05, pi05_rby1, groot, pi0, pi0fast")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
@@ -289,6 +289,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "XLA_FLAGS",
             "--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0")
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+    if config == "pi05_rby1" and int(num_views) == 2:
+        # Preserve the existing public default for standard Pi0.5 while making
+        # the RB-Y1 variant usable from examples/quickstart.py without requiring
+        # an extra --num_views flag.
+        num_views = 4
 
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 

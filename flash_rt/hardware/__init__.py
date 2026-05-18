@@ -83,6 +83,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi05", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
 
+    # ── Pi0.5 RB-Y1 variant ──
+    ("pi05_rby1", "torch", "thor"):
+        ("flash_rt.frontends.torch.pi05_rby1_thor", "Pi05Rby1TorchFrontendThor"),
+
     # ── Pi0 ── (Thor native + RTX consumer via pipeline_rtx.py.)
     ("pi0", "torch", "thor"):
         ("flash_rt.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
