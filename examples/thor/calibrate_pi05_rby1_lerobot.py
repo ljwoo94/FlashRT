@@ -44,7 +44,10 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         required=True,
-        help="LeRobot v2 repo_id or local dataset path",
+        help=(
+            "LeRobot v2 local dataset path, or repo_id when using "
+            "lerobot==0.1.0"
+        ),
     )
     parser.add_argument(
         "--prompt",

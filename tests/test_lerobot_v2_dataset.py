@@ -103,26 +103,51 @@ def test_load_calibration_obs_accepts_single_image_key_mapping():
     assert obs[0]["image"].dtype == np.uint8
 
 
-def test_import_lerobot_dataset_prefers_current_path():
+def test_import_lerobot_dataset_prefers_v2_legacy_path():
     from flash_rt.datasets.lerobot_v2 import _import_lerobot_dataset
 
-    sentinel = object()
-    module = types.ModuleType("lerobot.datasets")
-    module.LeRobotDataset = sentinel
+    legacy_sentinel = object()
+    current_sentinel = object()
+    current_module = types.ModuleType("lerobot.datasets")
+    current_module.LeRobotDataset = current_sentinel
+    legacy_module = types.ModuleType("lerobot.common.datasets.lerobot_dataset")
+    legacy_module.LeRobotDataset = legacy_sentinel
 
     old_lerobot = sys.modules.get("lerobot")
+    old_common = sys.modules.get("lerobot.common")
+    old_common_datasets = sys.modules.get("lerobot.common.datasets")
+    old_legacy = sys.modules.get("lerobot.common.datasets.lerobot_dataset")
     old_datasets = sys.modules.get("lerobot.datasets")
     pkg = types.ModuleType("lerobot")
     pkg.__path__ = []
+    common_pkg = types.ModuleType("lerobot.common")
+    common_pkg.__path__ = []
+    common_datasets_pkg = types.ModuleType("lerobot.common.datasets")
+    common_datasets_pkg.__path__ = []
     sys.modules["lerobot"] = pkg
-    sys.modules["lerobot.datasets"] = module
+    sys.modules["lerobot.common"] = common_pkg
+    sys.modules["lerobot.common.datasets"] = common_datasets_pkg
+    sys.modules["lerobot.common.datasets.lerobot_dataset"] = legacy_module
+    sys.modules["lerobot.datasets"] = current_module
     try:
-        assert _import_lerobot_dataset() is sentinel
+        assert _import_lerobot_dataset() is legacy_sentinel
     finally:
         if old_lerobot is None:
             sys.modules.pop("lerobot", None)
         else:
             sys.modules["lerobot"] = old_lerobot
+        if old_common is None:
+            sys.modules.pop("lerobot.common", None)
+        else:
+            sys.modules["lerobot.common"] = old_common
+        if old_common_datasets is None:
+            sys.modules.pop("lerobot.common.datasets", None)
+        else:
+            sys.modules["lerobot.common.datasets"] = old_common_datasets
+        if old_legacy is None:
+            sys.modules.pop("lerobot.common.datasets.lerobot_dataset", None)
+        else:
+            sys.modules["lerobot.common.datasets.lerobot_dataset"] = old_legacy
         if old_datasets is None:
             sys.modules.pop("lerobot.datasets", None)
         else:

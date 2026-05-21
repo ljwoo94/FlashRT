@@ -12,8 +12,9 @@ For the default RB-Y1 four-view schema, each observation is shaped as::
      "state":  float32[state_dim]}
 
 Images are HWC uint8 RGB arrays resized to ``image_size x image_size``.
-The loader is torch/CUDA-free; if a path or repo id is passed, it uses
-the installed LeRobot ``LeRobotDataset`` class when available.
+The loader is torch/CUDA-free. Local LeRobot-v2 roots are read directly
+from ``meta/info.json`` + parquet files. Repo ids use the LeRobot 0.1.x
+``lerobot.common.datasets.lerobot_dataset.LeRobotDataset`` API.
 """
 
 from __future__ import annotations
@@ -103,6 +104,9 @@ def load_calibration_obs(
 
 def _resolve_dataset(dataset: Any) -> Any:
     if isinstance(dataset, (str, pathlib.Path)):
+        path = pathlib.Path(dataset)
+        if (path / "meta" / "info.json").exists():
+            return _LocalLeRobotV2Dataset(path)
         return _open_lerobot_dataset(dataset)
     return dataset
 
@@ -116,57 +120,89 @@ def _open_lerobot_dataset(dataset: Union[str, pathlib.Path]) -> Any:
             "dataset/sequence of rows to load_calibration_obs()."
         )
 
-    path = pathlib.Path(dataset)
     value = str(dataset)
-    attempts = [{"repo_id": value}, {"root": path}]
-    local_repo_id = _local_repo_id(path)
-    if local_repo_id is not None:
-        attempts.insert(0, {"repo_id": local_repo_id, "root": path})
-
-    errors = []
-    for kwargs in attempts:
-        try:
-            return LeRobotDataset(**kwargs)
-        except Exception as exc:
-            errors.append(exc)
     try:
         return LeRobotDataset(value)
     except Exception as exc:
-        errors.append(exc)
-        message = "; ".join(str(e) for e in errors[-3:])
         raise RuntimeError(
-            f"Could not open LeRobotDataset for {value!r}. Constructor errors: {message}"
+            f"Could not open LeRobotDataset for repo_id/path {value!r}. "
+            "This loader targets LeRobot v2 datasets with lerobot==0.1.0; "
+            "for a local dataset root, pass the directory containing "
+            "meta/info.json."
         ) from exc
 
 
 def _import_lerobot_dataset() -> Any:
     try:
-        from lerobot.datasets import LeRobotDataset
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
         return LeRobotDataset
     except ImportError:
         pass
     try:
-        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets import LeRobotDataset
 
         return LeRobotDataset
     except ImportError:
         return None
 
 
-def _local_repo_id(path: pathlib.Path) -> Union[str, None]:
-    info_path = path / "meta" / "info.json"
-    if not info_path.exists():
-        return None
-    try:
+class _LocalLeRobotV2Dataset:
+    """Minimal local reader for LeRobot-v2 roots."""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+        info_path = root / "meta" / "info.json"
         with open(info_path, encoding="utf-8") as f:
-            info = json.load(f)
-    except Exception:
-        return None
-    repo_id = info.get("repo_id")
-    if repo_id is not None:
-        return str(repo_id)
-    return path.name
+            self.info = json.load(f)
+        self._rows = self._read_rows()
+        self.column_names = list(self._rows[0].keys()) if self._rows else []
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            return [row[key] for row in self._rows]
+        return self._rows[int(key)]
+
+    def _read_rows(self) -> List[Dict[str, Any]]:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "Reading a local LeRobot v2 root requires pyarrow. "
+                "Install pyarrow or pass an already-open LeRobotDataset."
+            ) from exc
+
+        data_path = self.info.get(
+            "data_path",
+            "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        )
+        chunks_size = int(self.info.get("chunks_size", 1000))
+        total_episodes = int(self.info.get("total_episodes", 0))
+        rows: List[Dict[str, Any]] = []
+
+        if total_episodes > 0:
+            paths = [
+                self.root / data_path.format(
+                    episode_chunk=ep // chunks_size,
+                    episode_index=ep,
+                )
+                for ep in range(total_episodes)
+            ]
+        else:
+            paths = sorted((self.root / "data").glob("**/*.parquet"))
+
+        for path in paths:
+            if not path.exists():
+                continue
+            table = pq.read_table(path)
+            rows.extend(table.to_pylist())
+
+        if not rows:
+            raise RuntimeError(f"no parquet rows found under {self.root!s}")
+        return rows
 
 
 def _sample_indices(

@@ -49,6 +49,10 @@ python examples/thor/calibrate_pi05_rby1_lerobot.py \
     --prompt "pick up the object and place it in the target location"
 ```
 
+For repo-id loading, use the LeRobot v2-compatible package path from
+`lerobot==0.1.0`; local dataset roots are read directly from
+`meta/info.json` and parquet files.
+
 ## NVFP4 (optional)
 
 Pi0.5 also supports NVFP4 encoder FFN on Thor, with the same E2E
