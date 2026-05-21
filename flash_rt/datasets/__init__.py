@@ -4,6 +4,8 @@ Current contents:
 
 * :mod:`flash_rt.datasets.libero` — LeRobot-v2 LIBERO layout
   (``meta/info.json`` + ``data/chunk-000/episode_XXXXXX.parquet``).
+* :mod:`flash_rt.datasets.lerobot_v2` — generic LeRobot-v2 row loader
+  for RB-Y1 four-view calibration observations.
 
 These modules are framework-agnostic: they return plain ``dict`` obs
 shaped like the frontend ``infer(obs)`` contract, so the same calibration

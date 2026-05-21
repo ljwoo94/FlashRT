@@ -40,6 +40,15 @@ The first invocation calibrates FP8 activation scales and saves them
 to `~/.flash_rt/calibration/`. Subsequent runs against the same
 checkpoint + prompt length skip calibration automatically (~0.1 s).
 
+## Calibrate RB-Y1 from LeRobot v2 data
+
+```bash
+python examples/thor/calibrate_pi05_rby1_lerobot.py \
+    --checkpoint /path/to/pi05_rby1_checkpoint \
+    --dataset /path/to/lerobot_v2_dataset \
+    --prompt "pick up the object and place it in the target location"
+```
+
 ## NVFP4 (optional)
 
 Pi0.5 also supports NVFP4 encoder FFN on Thor, with the same E2E
